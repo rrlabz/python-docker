@@ -1,0 +1,180 @@
+
+# ==========================================================
+# STAGE 1: BUILD PYTHON FROM SOURCE
+# ==========================================================
+
+FROM debian:bookworm-slim AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    wget \
+    ca-certificates \
+    xz-utils \
+    pax-utils \
+    binutils \
+    libssl-dev \
+    zlib1g-dev \
+    libffi-dev \
+    libbz2-dev \
+    libreadline-dev \
+    libsqlite3-dev \
+    liblzma-dev \
+    libncurses-dev \
+    libgdbm-dev \
+    libexpat1-dev \
+    uuid-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG PYTHON_VERSION=3.15.2
+ARG PYTHON_SHA256=f74e1db0eabd651cd01e4e2a00201bd41866abe74869ab716f9bf33cbbaa0943
+
+WORKDIR /build
+
+# Download and verify Python source
+RUN wget -q \
+    https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz \
+    && echo "${PYTHON_SHA256}  Python-${PYTHON_VERSION}.tgz" \
+       | sha256sum -c - \
+    && tar -xzf Python-${PYTHON_VERSION}.tgz
+
+WORKDIR /build/Python-${PYTHON_VERSION}
+
+# Configure Python
+RUN ./configure \
+    --prefix=/opt/python \
+    --enable-shared \
+    --with-ensurepip=install \
+    --without-static-libpython
+
+# Compile and install
+RUN make -j"$(nproc)" \
+    && make install
+
+ENV LD_LIBRARY_PATH=/opt/python/lib
+
+# ==========================================================
+# STAGE 2: PREPARE MINIMAL ROOT FILESYSTEM
+# ==========================================================
+
+FROM builder AS rootfs
+
+# Create root filesystem directories
+RUN mkdir -p \
+    /rootfs/opt \
+    /rootfs/etc/ssl/certs \
+    /rootfs/tmp \
+    /rootfs/home/python
+
+# Copy Python, standard library and pip
+RUN cp -a /opt/python /rootfs/opt/python
+
+# ----------------------------------------------------------
+# Remove unnecessary development and test files
+# ----------------------------------------------------------
+
+RUN set -eux; \
+    rm -rf \
+        /rootfs/opt/python/lib/python3.15/test \
+        /rootfs/opt/python/lib/python3.15/idlelib \
+        /rootfs/opt/python/lib/python3.15/turtledemo \
+        /rootfs/opt/python/include \
+        /rootfs/opt/python/share/man \
+        /rootfs/opt/python/lib/pkgconfig; \
+    find /rootfs/opt/python -type d -name __pycache__ \
+        -prune -exec rm -rf {} +; \
+    find /rootfs/opt/python -type f \
+        \( -name '*.a' -o -name '*.la' \) -delete
+
+# ----------------------------------------------------------
+# Collect Python runtime dependencies
+# ----------------------------------------------------------
+
+RUN set -eux; \
+    find /rootfs/opt/python -type f \
+      \( -name 'python3.15' \
+         -o -name '*.so' \
+         -o -name '*.so.*' \) \
+      -exec sh -c ' \
+        for file do \
+          lddtree -l "$file" || exit 1; \
+        done \
+      ' sh {} + \
+      | sort -u > /tmp/runtime-libs.txt
+
+# ----------------------------------------------------------
+# Collect NSS dependencies for DNS resolution
+# ----------------------------------------------------------
+
+RUN set -eux; \
+    for lib in \
+        /lib/*/libnss_dns.so.2 \
+        /lib/*/libnss_files.so.2; do \
+        if [ -f "$lib" ]; then \
+            lddtree -l "$lib" >> /tmp/runtime-libs.txt; \
+        fi; \
+    done; \
+    sort -u -o /tmp/runtime-libs.txt /tmp/runtime-libs.txt
+
+# ----------------------------------------------------------
+# Copy runtime shared libraries
+# ----------------------------------------------------------
+
+RUN set -eux; \
+    while IFS= read -r lib; do \
+        if [ -f "$lib" ]; then \
+            cp -L --parents "$lib" /rootfs; \
+        fi; \
+    done < /tmp/runtime-libs.txt
+
+# ----------------------------------------------------------
+# CA certificates
+# ----------------------------------------------------------
+
+RUN cp -a /etc/ssl/certs /rootfs/etc/ssl/
+
+# ----------------------------------------------------------
+# User and group configuration
+# ----------------------------------------------------------
+
+RUN printf 'python:x:10001:10001:Python User:/home/python:/nonexistent\n' \
+      > /rootfs/etc/passwd \
+    && printf 'python:x:10001:\n' \
+      > /rootfs/etc/group \
+    && printf 'hosts: files dns\n' \
+      > /rootfs/etc/nsswitch.conf
+
+# ----------------------------------------------------------
+# Runtime permissions
+# ----------------------------------------------------------
+
+RUN chmod 1777 /rootfs/tmp \
+    && chown -R 10001:10001 /rootfs/home/python
+
+# ==========================================================
+# STAGE 3: FINAL SCRATCH IMAGE
+# ==========================================================
+
+FROM scratch
+
+# Copy minimal runtime filesystem
+COPY --from=rootfs /rootfs/ /
+
+# Python environment
+ENV PATH="/opt/python/bin"
+ENV LD_LIBRARY_PATH="/opt/python/lib"
+ENV HOME="/home/python"
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt"
+
+# Working directory
+WORKDIR /app
+
+# Non-root execution
+USER 10001:10001
+
+# Default command
+CMD ["python3"]
