@@ -101,7 +101,11 @@ RUN set -eux; \
         \( -name '*_test*.so' -o -name '_test*.so' \) \
         -delete
 
+# Remove pip's embedded SBOM containing stale setuptools metadata
+RUN rm -f \
+    /rootfs/opt/python/lib/python3.15/site-packages/pip/_vendor/bom.cdx.json
 
+    
 # ----------------------------------------------------------
 # Remove Windows-specific pip launchers
 # ----------------------------------------------------------
