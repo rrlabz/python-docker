@@ -135,6 +135,14 @@ RUN set -eux; \
       ' sh {} + \
       | sort -u > /tmp/runtime-libs.txt
 
+
+# Include GCC runtime library for third-party native extensions
+RUN set -eux; \
+    find /lib /usr/lib -name 'libgcc_s.so.1' \
+        -exec lddtree -l {} \; \
+        >> /tmp/runtime-libs.txt; \
+    sort -u -o /tmp/runtime-libs.txt /tmp/runtime-libs.txt
+
 # ----------------------------------------------------------
 # Collect NSS dependencies for DNS resolution
 # ----------------------------------------------------------
@@ -143,6 +151,22 @@ RUN set -eux; \
     for lib in \
         /lib/*/libnss_dns.so.2 \
         /lib/*/libnss_files.so.2; do \
+        if [ -f "$lib" ]; then \
+            lddtree -l "$lib" >> /tmp/runtime-libs.txt; \
+        fi; \
+    done; \
+    sort -u -o /tmp/runtime-libs.txt /tmp/runtime-libs.txt
+
+# ----------------------------------------------------------
+# Collect additional glibc runtime dependencies
+# ----------------------------------------------------------
+
+RUN set -eux; \
+    for lib in \
+        /lib/*/librt.so.1 \
+        /usr/lib/*/librt.so.1 \
+        /lib/*/libgcc_s.so.1 \
+        /usr/lib/*/libgcc_s.so.1; do \
         if [ -f "$lib" ]; then \
             lddtree -l "$lib" >> /tmp/runtime-libs.txt; \
         fi; \
@@ -200,7 +224,7 @@ RUN set -eux; \
 # STAGE 3: FINAL SCRATCH IMAGE
 # ==========================================================
 
-FROM scratch
+FROM scratch AS python-runtime
 
 # Copy minimal runtime filesystem
 COPY --from=rootfs /rootfs/ /
@@ -221,3 +245,80 @@ USER 10001:10001
 
 # Default command
 CMD ["python3"]
+
+
+
+# ==========================================================
+# STAGE 4: INSTALL APPLICATION DEPENDENCIES
+# ==========================================================
+
+FROM builder AS app-builder
+
+WORKDIR /app
+
+COPY requirements.txt .
+
+# Install dependencies using the exact Python version
+# used in the custom runtime
+RUN /opt/python/bin/python3.15 -m pip install \
+    --no-cache-dir \
+    --retries 10 \
+    --timeout 60 \
+    --target=/app/dependencies \
+    -r requirements.txt
+
+
+# ----------------------------------------------------------
+# Collect native shared-library dependencies
+# ----------------------------------------------------------
+
+RUN set -eux; \
+    mkdir -p /runtime-libs; \
+    find /app/dependencies -type f \
+        \( -name '*.so' -o -name '*.so.*' \) \
+        -exec sh -c ' \
+            for file do \
+                lddtree -l "$file"; \
+            done \
+        ' sh {} + \
+        | grep -E '^/(lib|lib64|usr/lib|usr/lib64)/' \
+        | sort -u > /tmp/app-runtime-libs.txt; \
+    while IFS= read -r lib; do \
+        if [ -f "$lib" ]; then \
+            cp -L --parents "$lib" /runtime-libs/; \
+        fi; \
+    done < /tmp/app-runtime-libs.txt
+
+
+# ==========================================================
+# STAGE 5: FINAL APPLICATION IMAGE
+# ==========================================================
+
+FROM python-runtime AS final
+
+WORKDIR /app
+
+# Application-specific shared libraries
+COPY --from=app-builder /runtime-libs/ /
+
+# Application dependencies
+COPY --from=app-builder /app/dependencies /app/dependencies
+
+# Application source
+COPY --chown=10001:10001 app ./app
+
+# Python module search path
+ENV PYTHONPATH="/app/dependencies"
+
+# OCI Image Metadata
+LABEL org.opencontainers.image.title="demoapi_py"
+LABEL org.opencontainers.image.description="FastAPI demo application"
+LABEL org.opencontainers.image.source="https://github.com/rrlabz/demoapi_py"
+LABEL org.opencontainers.image.licenses="MIT"
+
+EXPOSE 8000
+
+# Run as the non-root user inherited from python-runtime
+USER 10001:10001
+
+CMD ["python3", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

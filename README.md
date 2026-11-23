@@ -5,7 +5,7 @@ python-3.15.2 docker image
 # Build the Python 3.15.2 slim image.
 docker buildx build \
     --load \
-    -f Dockerfile-slim-v2 \
+    -f Dockerfile-slim \
     -t python-scratch:3.15.2-slim .
 
 
